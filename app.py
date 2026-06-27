@@ -34,8 +34,9 @@ CODA_BASE = "https://coda.io/apis/v1"
 ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH"} | ({"DELETE"} if ALLOW_DELETE else set())
 
 # --- /export/rsds config --------------------------------------------------
-RSDS_DOC   = "4YIajnJqvo"
-RSDS_TABLE = "grid-5p9sHmnPst"   # _Rich Skill Descriptors (RSDs)
+RSDS_DOC         = "4YIajnJqvo"
+RSDS_TABLE       = "grid-5p9sHmnPst"   # _Rich Skill Descriptors (RSDs)
+RSDS_PROGRAM_COL = "c-6PVzDyCf6h"      # Program (lookup) — used for the ?program= filter
 # (CSV header, Coda column name). The header is what shows up in the file;
 # the source is the EXACT column label in the table. They differ for Category,
 # whose real column is "Skill Category".
@@ -76,16 +77,20 @@ def cell_to_text(value):
     return str(value)
 
 
-def fetch_all_rows(doc_id, table_id, attempts=3):
-    """Page through every row of a table, keyed by column name.
+def fetch_all_rows(doc_id, table_id, query=None, attempts=3):
+    """Page through a table's rows, keyed by column name.
 
-    Retries connection/timeout errors and Coda 5xx with a short backoff so a
-    cold read doesn't surface as a 500. Genuine 4xx are raised immediately.
+    If `query` is given (Coda rows query syntax, e.g. 'c-xxxx:"value"'), the
+    filter runs server-side so a scoped export is a single page. Retries
+    connection/timeout/5xx with backoff so a cold read doesn't surface as a 500;
+    genuine 4xx are raised immediately.
     """
     rows = []
     url = f"{CODA_BASE}/docs/{doc_id}/tables/{table_id}/rows"
     headers = {"Authorization": f"Bearer {CODA_TOKEN}"}
     params = {"useColumnNames": "true", "valueFormat": "simpleWithArrays", "limit": 200}
+    if query:
+        params["query"] = query
     while True:
         body = None
         for attempt in range(attempts):
@@ -107,7 +112,7 @@ def fetch_all_rows(doc_id, table_id, attempts=3):
         token = body.get("nextPageToken")
         if not token:
             break
-        params = {"pageToken": token}   # subsequent pages: token only
+        params = {"pageToken": token}   # subsequent pages: token only (query is baked in)
     return rows
 
 
@@ -128,8 +133,13 @@ def export_rsds():
     if not (key and hmac.compare_digest(key, EXPORT_TOKEN)):
         return Response("unauthorized", status=401)
 
+    # Optional program scope. When the button passes the current user's selected
+    # program, we filter server-side (one page). Empty -> export everything.
+    program = request.args.get("program", "").strip()
+    query = f'{RSDS_PROGRAM_COL}:"{program}"' if program else None
+
     try:
-        rows = fetch_all_rows(RSDS_DOC, RSDS_TABLE)
+        rows = fetch_all_rows(RSDS_DOC, RSDS_TABLE, query=query)
     except requests.RequestException as e:
         return Response(f"coda read failed: {e}", status=502)
 
@@ -140,12 +150,14 @@ def export_rsds():
         values = row.get("values", {})
         writer.writerow([cell_to_text(values.get(src)) for _, src in RSDS_COLUMNS])
 
+    # filename reflects the scope so multiple program exports don't collide
+    safe = "".join(c if c.isalnum() else "_" for c in program).strip("_") or "all"
     return Response(
         buf.getvalue(),
         status=200,
         content_type="text/csv; charset=utf-8",
         headers={
-            "Content-Disposition": 'attachment; filename="rsds.csv"',
+            "Content-Disposition": f'attachment; filename="rsds_{safe}.csv"',
             "Cache-Control": "no-store",
         },
     )
