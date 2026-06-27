@@ -17,6 +17,7 @@ Env vars (set these in Render's Environment tab — never in code or git):
 import os
 import io
 import csv
+import time
 import hmac
 import requests
 from flask import Flask, request, Response
@@ -33,9 +34,18 @@ CODA_BASE = "https://coda.io/apis/v1"
 ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH"} | ({"DELETE"} if ALLOW_DELETE else set())
 
 # --- /export/rsds config --------------------------------------------------
-RSDS_DOC     = "4YIajnJqvo"
-RSDS_TABLE   = "grid-5p9sHmnPst"   # _Rich Skill Descriptors (RSDs)
-RSDS_COLUMNS = ["Program", "Category", "Canonical URL", "Skill Title", "Skill Statement"]
+RSDS_DOC   = "4YIajnJqvo"
+RSDS_TABLE = "grid-5p9sHmnPst"   # _Rich Skill Descriptors (RSDs)
+# (CSV header, Coda column name). The header is what shows up in the file;
+# the source is the EXACT column label in the table. They differ for Category,
+# whose real column is "Skill Category".
+RSDS_COLUMNS = [
+    ("Program",         "Program"),
+    ("Category",        "Skill Category"),
+    ("Canonical URL",   "Canonical URL"),
+    ("Skill Title",     "Skill Title"),
+    ("Skill Statement", "Skill Statement"),
+]
 # --------------------------------------------------------------------------
 
 
@@ -66,16 +76,33 @@ def cell_to_text(value):
     return str(value)
 
 
-def fetch_all_rows(doc_id, table_id):
-    """Page through every row of a table, keyed by column name."""
+def fetch_all_rows(doc_id, table_id, attempts=3):
+    """Page through every row of a table, keyed by column name.
+
+    Retries connection/timeout errors and Coda 5xx with a short backoff so a
+    cold read doesn't surface as a 500. Genuine 4xx are raised immediately.
+    """
     rows = []
     url = f"{CODA_BASE}/docs/{doc_id}/tables/{table_id}/rows"
     headers = {"Authorization": f"Bearer {CODA_TOKEN}"}
     params = {"useColumnNames": "true", "valueFormat": "simpleWithArrays", "limit": 200}
     while True:
-        r = requests.get(url, headers=headers, params=params, timeout=30)
-        r.raise_for_status()
-        body = r.json()
+        body = None
+        for attempt in range(attempts):
+            try:
+                r = requests.get(url, headers=headers, params=params, timeout=30)
+                if r.status_code >= 500:
+                    raise requests.HTTPError(f"{r.status_code} from Coda", response=r)
+                r.raise_for_status()   # 4xx -> raise (not retried below)
+                body = r.json()
+                break
+            except (requests.ConnectionError, requests.Timeout, requests.HTTPError) as e:
+                resp = getattr(e, "response", None)
+                if resp is not None and 400 <= resp.status_code < 500:
+                    raise  # client error — don't retry
+                if attempt == attempts - 1:
+                    raise
+                time.sleep(1.5 * (attempt + 1))
         rows.extend(body.get("items", []))
         token = body.get("nextPageToken")
         if not token:
@@ -103,15 +130,15 @@ def export_rsds():
 
     try:
         rows = fetch_all_rows(RSDS_DOC, RSDS_TABLE)
-    except requests.HTTPError as e:
+    except requests.RequestException as e:
         return Response(f"coda read failed: {e}", status=502)
 
     buf = io.StringIO()
     writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
-    writer.writerow(RSDS_COLUMNS)
+    writer.writerow([header for header, _ in RSDS_COLUMNS])
     for row in rows:
         values = row.get("values", {})
-        writer.writerow([cell_to_text(values.get(c)) for c in RSDS_COLUMNS])
+        writer.writerow([cell_to_text(values.get(src)) for _, src in RSDS_COLUMNS])
 
     return Response(
         buf.getvalue(),
