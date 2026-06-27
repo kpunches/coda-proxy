@@ -9,8 +9,14 @@ Env vars (set these in Render's Environment tab — never in code or git):
   PROXY_SECRET  required  the secret callers must present (rotate to revoke access)
   ALLOWED_DOC   optional  restrict to one doc id, e.g. 4YIajnJqvo (blast-radius control)
   ALLOW_DELETE  optional  set to "1" to permit DELETE (off by default)
+  EXPORT_TOKEN  optional  read-only token for the /export/* CSV links (see below).
+                          Kept SEPARATE from PROXY_SECRET: it travels in a URL /
+                          Coda button formula in plaintext, so leaking it must not
+                          grant write access. If unset, /export/* returns 503.
 """
 import os
+import io
+import csv
 import hmac
 import requests
 from flask import Flask, request, Response
@@ -21,9 +27,16 @@ CODA_TOKEN   = os.environ["CODA_TOKEN"]
 PROXY_SECRET = os.environ["PROXY_SECRET"]
 ALLOWED_DOC  = os.environ.get("ALLOWED_DOC", "").strip()
 ALLOW_DELETE = os.environ.get("ALLOW_DELETE", "") == "1"
+EXPORT_TOKEN = os.environ.get("EXPORT_TOKEN", "").strip()
 
 CODA_BASE = "https://coda.io/apis/v1"
 ALLOWED_METHODS = {"GET", "POST", "PUT", "PATCH"} | ({"DELETE"} if ALLOW_DELETE else set())
+
+# --- /export/rsds config --------------------------------------------------
+RSDS_DOC     = "4YIajnJqvo"
+RSDS_TABLE   = "grid-5p9sHmnPst"   # _Rich Skill Descriptors (RSDs)
+RSDS_COLUMNS = ["Program", "Category", "Canonical URL", "Skill Title", "Skill Statement"]
+# --------------------------------------------------------------------------
 
 
 def authorized(req):
@@ -35,10 +48,80 @@ def authorized(req):
     return bool(sent) and hmac.compare_digest(sent, PROXY_SECRET)
 
 
+def cell_to_text(value):
+    """Coerce a Coda cell value to plain text, mirroring .ToText()."""
+    if value is None:
+        return ""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (int, float)):
+        return str(value)
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        # hyperlink cell -> url; relation row -> name; otherwise fall back
+        return value.get("url") or value.get("name") or value.get("value") or ""
+    if isinstance(value, list):
+        return "; ".join(cell_to_text(v) for v in value if v is not None)
+    return str(value)
+
+
+def fetch_all_rows(doc_id, table_id):
+    """Page through every row of a table, keyed by column name."""
+    rows = []
+    url = f"{CODA_BASE}/docs/{doc_id}/tables/{table_id}/rows"
+    headers = {"Authorization": f"Bearer {CODA_TOKEN}"}
+    params = {"useColumnNames": "true", "valueFormat": "simpleWithArrays", "limit": 200}
+    while True:
+        r = requests.get(url, headers=headers, params=params, timeout=30)
+        r.raise_for_status()
+        body = r.json()
+        rows.extend(body.get("items", []))
+        token = body.get("nextPageToken")
+        if not token:
+            break
+        params = {"pageToken": token}   # subsequent pages: token only
+    return rows
+
+
 @app.route("/healthz")
 def healthz():
     # no auth, no Coda call — just confirms the service is up
     return "ok", 200
+
+
+@app.route("/export/rsds")
+def export_rsds():
+    # Reached by a plain browser navigation from a Coda OpenWindow() button,
+    # which can't send headers — so auth is a query-string token, deliberately
+    # separate from PROXY_SECRET so this read-only link can't be used to write.
+    if not EXPORT_TOKEN:
+        return Response("export not configured", status=503)
+    key = request.args.get("key", "")
+    if not (key and hmac.compare_digest(key, EXPORT_TOKEN)):
+        return Response("unauthorized", status=401)
+
+    try:
+        rows = fetch_all_rows(RSDS_DOC, RSDS_TABLE)
+    except requests.HTTPError as e:
+        return Response(f"coda read failed: {e}", status=502)
+
+    buf = io.StringIO()
+    writer = csv.writer(buf, quoting=csv.QUOTE_ALL)
+    writer.writerow(RSDS_COLUMNS)
+    for row in rows:
+        values = row.get("values", {})
+        writer.writerow([cell_to_text(values.get(c)) for c in RSDS_COLUMNS])
+
+    return Response(
+        buf.getvalue(),
+        status=200,
+        content_type="text/csv; charset=utf-8",
+        headers={
+            "Content-Disposition": 'attachment; filename="rsds.csv"',
+            "Cache-Control": "no-store",
+        },
+    )
 
 
 @app.route("/v1/<path:subpath>", methods=["GET", "POST", "PUT", "PATCH", "DELETE"])
